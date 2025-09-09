@@ -1,4 +1,4 @@
-# PCA and Clustering Project: Business Dynamism Across Countries
+# PCA and Clustering Project: Business dynamism across countries
 
 This repository contains the midterm project for the **Advanced Modeling** course of the Master in Computational Social Sciences at Universidad Carlos III de Madrid.  
 The project investigates whether countries can be classified according to their **business dynamism** using **Principal Component Analysis (PCA)** and **clustering techniques**.
