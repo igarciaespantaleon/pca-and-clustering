@@ -1,0 +1,715 @@
+---
+title: "Advanced Modeling - Midterm project"
+author: "Irene García-Espantaleón Artal"
+date: "2025-02-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The present exercise seeks to answer the question: "**can countries be classified based on their business dynamism?**".
+
+Through the application of Principal Component Analysis (PCA) and clustering techniques, we analyze a set of economic and administrative indicators that reflect the business environment across different nations. By reducing dimensionality and identifying underlying patterns, this study aims to uncover meaningful groupings of countries and provide insights into the factors that shape business accessibility worldwide.
+
+For this purpose, we will be using a database retrieved from the World Bank, containing World Development Indicators (WDI) at the country level. According to the source, the data were last updated on September of 2022.
+
+## Libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(GGally)
+library(factoextra)
+library(countrycode)
+library(DataExplorer)
+library(rworldmap)
+library(mice)
+library(plotly)
+library(janitor)
+library(e1071)
+library(ggpubr)
+library(ggrepel)
+library(cluster)
+library(mclust)
+set.seed(123)
+```
+
+## Data load and cleaning
+
+```{r, message = FALSE, warning = FALSE}
+WDI <- read_csv("WDI_JOBS.csv", na = ".." )
+head(WDI)
+```
+
+The columns have very long names, so I did a preliminary cleaning to make them more legible.
+
+```{r}
+colnames(WDI) <- gsub(" \\[.*", "", colnames(WDI))
+colnames(WDI)
+```
+
+We can see that the column names are pretty descriptive of the variables. This list provides very useful information to have at hand, however, it is way too messy for column names, so we clean them again.
+
+```{r}
+colnames(WDI) <- colnames(WDI) |> 
+  str_remove_all("\\(.+\\)") |>  
+  make_clean_names()
+
+colnames(WDI)
+```
+
+After cleaning the variable names, we can further explore the dataset.
+
+## EDA and feature engineering
+
+I explored the dataset and found out that the last few rows didn't contain any relevant data and were all NAs, so I dropped them.
+
+```{r}
+tail(WDI, 6)
+WDI <- WDI[1:217, ]
+```
+
+Having removed the rows that didn't correspond to actual observations, we can plot the missing data.
+
+```{r}
+plot_missing(WDI)
+```
+
+We observe that many variables have a considerable proportion of NAs. Here I have chosen to establish a threshold of 50% of missing data to discard some columns, since our dataset contains 49 and we don't need as many for this analysis.
+
+```{r}
+df <- WDI |> 
+  select_if(~mean(is.na(.)) < 0.5)
+```
+
+With this step we went from 49 to 34 variables. We can now look at the missingness by rows, in order to decide whether it is advisable to drop some observations altogether, or if it is more appropriate to make imputations instead.
+
+```{r}
+df |> 
+  as.data.frame() |> 
+  mutate(na_percentage = rowSums(is.na(df)) / ncol(df) * 100) |> 
+  select(country_name, na_percentage) |> 
+  filter(na_percentage > 0) |> 
+  arrange(desc(na_percentage))
+```
+
+The high percentage of missing data in certain territories or small countries follows a recognizable pattern, suggesting that the missingness is not due to random chance but is influenced by external factors (e. g. their size, geographical location, special political status, etc.). Making imputations when data is not missing at random is not recommended. Furthermore, ff a row has more than 50% missing data, imputing those values can be quite unreliable. The fewer the known values in a row, the less information there is to make a good imputation. Removing rows with excessive missingness might help maintain the integrity of our data. With this in mind, I chose again a threshold of 50% to drop or keep the observations in the dataset. This reduces the chance of adding noise to our analysis, while still preserving the dimensions required for this exercise.
+
+```{r}
+df_clean <- df |>
+  mutate(na_percentage = rowSums(is.na(df)) / ncol(df) * 100) |> 
+  filter(na_percentage <= 50) |>  # Keep only rows with <= 50% missing data
+  select(-na_percentage)
+```
+
+After this step we lose 25 observations, but still have almost 200 to work with.
+
+It is now time to make imputations to the missing data in our dataset, using the mice package and the random forest method.
+
+```{r, results = "hide", warning = FALSE}
+m = 4 # number of multiple imputations
+
+imputations <- mice(df_clean, m = m, method = 'rf')
+df_imp <- complete(imputations, action = m)
+```
+
+By running the following code, we check that all NAs in our data have been safely imputed.
+
+```{r}
+colSums(is.na(df_imp))
+```
+
+I noticed that the imputation method systematically excluded one variable, wage_and_salaried_workers_total, and ended up coming to the conclusion that it is because it's perfectly correlated to self_employed, which means that we can safely drop it from df_imp since it does not provide any new information.
+
+```{r}
+# test the correlation
+cor(df_clean$wage_and_salaried_workers_total, df_clean$self_employed_total, use = "complete.obs")
+
+df_imp <- df_imp |> 
+  select(-wage_and_salaried_workers_total)
+```
+
+This left us with 13 numeric variables that we will use in the PCA and clustering, and two categorical ones that serve as identifiers.
+
+Now it is time to make our selection, choosing the most relevant variables to our research question regarding business environment. Apart from the two identifiers, we chose:
+
+-   **New business density** – Related to entrepreneurial activity and business dynamism.
+-   **Time required to enforce a contract** – Related to legal efficiency and contract enforcement.
+-   **Time required to register property** – Related to administrative burdens and ease of asset security.
+-   **Time required to start a business** – Related to bureaucratic efficiency and ease of business entry.
+-   **Tax payments** – Related to tax complexity and regulatory burden.
+-   **Public credit registry coverage** – Related to access to credit and financial transparency.
+-   **Foreign direct investment net inflows** – Related to business attractiveness, economic dynamism and investment climate.
+-   **GDP per capita** – Related to economic prosperity and market potential.
+-   **Exports of goods and services** – Related to business competitiveness and market openness.
+-   **Domestic credit provided by the financial sector** – Related to financial support for businesses.
+-   **Domestic credit to the private sector** – Related to business financing and access to capital.
+-   **Self-employed, total** – Related to entrepreneurial participation and informal employment.
+-   **Unemployment, total** – Related to economic stability and labor market conditions.
+
+```{r}
+df_imp <- df_imp |>
+  select(
+    country_name,
+    country_code,
+    new_business_density,
+    time_required_to_enforce_a_contract,
+    time_required_to_register_property,
+    time_required_to_start_a_business,
+    tax_payments,
+    public_credit_registry_coverage,
+    foreign_direct_investment_net_inflows,
+    gdp_per_capita_ppp,
+    exports_of_goods_and_services,
+    domestic_credit_provided_by_financial_sector,
+    domestic_credit_to_private_sector,
+    self_employed_total,
+    unemployment_total
+    )
+```
+
+We can now manually shorten the names to make them more convenient for plots, tables, etc.
+
+```{r}
+# Original to new name mapping
+new_names <- c(
+  "country_name" = "country_name",
+  "country_code" = "country_code",
+  "new_business_density" = "new_business_dens",
+  "time_required_to_enforce_a_contract" = "enforce_contract_t",
+  "time_required_to_register_property" = "register_property_t",
+  "time_required_to_start_a_business" = "start_business_t",
+  "tax_payments" = "tax_payments",
+  "public_credit_registry_coverage" = "credit_cover",
+  "foreign_direct_investment_net_inflows" = "foreign_invest",
+  "gdp_per_capita_ppp" = "gdp_pc",
+  "exports_of_goods_and_services" = "exports",
+  "domestic_credit_provided_by_financial_sector" = "credit_finance",
+  "domestic_credit_to_private_sector" = "credit_private",
+  "self_employed_total" = "self_employed",
+  "unemployment_total" = "unemploy"
+)
+
+names(df_imp) <- new_names[names(df_imp)]
+```
+
+Afterwards, I separated the numerical variables from the identifiers.
+
+```{r}
+# Store identifiers
+id_cols <- df_imp |> select(country_name, country_code)
+
+# Work with numeric data
+numeric_df <- df_imp |>  select_if(is.numeric)
+```
+
+At this stage, I took the time to join a column with the continents that will be helpful for visualizations, using the package {countrycode}.
+
+```{r}
+continent_data <- 
+  countrycode::codelist  |>  select(iso3c, continent)
+
+id_cols <- 
+  id_cols  |>  
+  left_join(continent_data, by = c("country_code" = "iso3c"))
+
+colSums(is.na(id_cols))
+```
+
+I found that there was one single NA in the continent column, so I ran this to check what country it corresponded to:
+
+```{r}
+id_cols|> filter(is.na(continent))
+```
+
+According to this code, it is Kosovo. We can manually introduce the continent for this country:
+
+```{r}
+id_cols <- id_cols |> 
+  mutate(continent = ifelse(country_name == "Kosovo", "Europe", continent))
+
+# double check
+id_cols|> filter(country_name == "Kosovo")
+```
+
+We can move on to plotting each variable's distributions:
+
+```{r}
+numeric_df |> 
+  gather(key = "Variable", value = "Value") |> 
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ Variable, scales = "free")
+```
+
+Many variables show a significant skew that we will have to handle before the analysis, applying transformations to make them more normal:
+
+```{r}
+skewness_values <- sapply(numeric_df, skewness, na.rm = TRUE)
+
+skewness_df <- data.frame(
+  variable = names(skewness_values),
+  skewness = skewness_values)
+
+# check what variables are more skewed
+high_skew <- skewness_df |>
+  filter(abs(skewness) > 1.5)
+
+high_skew
+
+# check the range of the variables because that will affect the transformations we can do
+sapply(numeric_df[high_skew$variable], range, na.rm = TRUE)
+```
+
+This is the selection of variables that we need to transform, but one of them has negative values and another one has zeros, so we plot their distributions in order to make the best choice about the transformations.
+
+```{r}
+foreign_plot <- ggplot(numeric_df, aes(x = foreign_invest)) +
+  geom_histogram(bins = 30, fill = "gray") +
+  theme_minimal()
+
+credit_plot <- ggplot(numeric_df, aes(x = credit_cover)) +
+  geom_histogram(bins = 30, fill = "gray") +
+  theme_minimal()
+
+ggarrange(foreign_plot, credit_plot)
+```
+
+Looking at this, I concluded that the transformations should be as follows:
+
+```{r}
+X <- numeric_df |>
+  mutate(
+    # For variables with negative values or zeros
+    foreign_invest = log(foreign_invest + abs(min(foreign_invest)) + 1),
+    credit_cover = log(credit_cover + 1),
+
+    # Regular log transformations for the rest
+    new_business_dens = log(new_business_dens),
+    register_property_t = log(register_property_t),
+    start_business_t = log(start_business_t),
+    gdp_pc = log(gdp_pc),
+    exports = log(exports)
+  )
+```
+
+We can plot again the distributions to check that they are indeed less skewed.
+
+```{r}
+numeric_df |>
+  gather(key = "Variable", value = "Value") |>
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ Variable, scales = "free")
+
+X |>
+  gather(key = "Variable", value = "Value") |>
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ Variable, scales = "free")
+```
+
+Next, I plotted the correlation matrix to check the relationships between the variables chosen for my study.
+
+```{r}
+cor_matrix <- cor(X, use = "complete.obs")
+
+corrplot::corrplot(cor_matrix, method = "circle")
+```
+
+The variables unemployment, credit coverage and foreign investment seem to have a very low correlation to any other variables in the dataset. These variables may not strongly influence the business environment or maybe they play a more indirect role. We cannot expect them to have a very high contribution to the PCA and clustering analysis.
+
+On the other hand, the higher negative correlation can be found between self employment and GDP per capita, suggesting that, in countries with higher GDP per capita, self-employment is less common (possibly because salaried jobs are more accessible and stable).
+
+The higher positive correlation is found between domestic credit to private sector and domestic credit provided by financial sector, which makes sense considering that financial sector depth often translates into more credit available for private businesses.
+
+We can make some visualizations to support these ideas:
+
+```{r, warning = FALSE}
+ggplot(X, aes(x = gdp_pc, y = self_employed, color = id_cols$continent)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_text_repel(aes(label = id_cols$country_name), 
+                  size = 3, max.overlaps = 10) +
+  labs(title = "Self-Employment vs GDP per Capita",
+       x = "GDP per capita",
+       y = "Self-Employment (% of total employment)",
+       color = "Continent") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The plot reveals clear geographic patterns:
+
+-   **African countries** (red dots) cluster in the upper left, showing lower GDP per capita and higher self-employment rates (often \>50%), suggesting economies where formal employment opportunities are limited.
+
+-   **European countries** (blue dots) tend to appear in the lower right, with higher GDP and lower self-employment: in these countries, salaried positions with higher social safety and more protection seem more common. A few of the leftmost points are labeled, revealing some of the continent's least advanced economies.
+
+-   **Asian and Oceanic countries** (green and pink dots) show greater variation, spanning much of the plot, which supports the idea that these are highly heterogeneous continents (specially Asia).
+
+-   **American countries** (yellow-ish dots) are also slightly spread, although they seem to cluster around the center of the graph.
+
+```{r, warning = FALSE}
+ggplot(X, aes(x = credit_private,
+                 y = credit_finance,
+                 color = id_cols$continent)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_text_repel(aes(label = id_cols$country_name), 
+                  size = 3, max.overlaps = 10) +
+  labs(title = "Domestic Credit: Financial Sector vs. Private Sector",
+       x = "Domestic Credit Provided by Financial Sector (% of GDP)",
+       y = "Domestic Credit to Private Sector (% of GDP)",
+       color = "Continent") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Again, Africa seems to be the most homogeneous continent, with its countries clustering towards the lower left quadrant. Most American countries also occupy this area of the plot, with a number of important outliers (Chile, Canada, Peru and the US). A few advanced Asian economies reveal the highest values on both measures. Both Asian and European countries appear fairly spread.
+
+## Principal Components Analysis
+
+In this section, we will apply Principal Components Analysis (PCA) to reduce the dimensionality of our dataset, identify key patterns in the data, and explore how countries distribute along the main components related to business environment characteristics. Each PC generated is a linear combination of the original variables, with the loadings (coefficients) indicating the weight of each original variable in the PC. The variables can contribute positively (positive coefficients) or negatively (negative coefficients) to the PC.
+
+```{r}
+pca <- prcomp(X, scale = TRUE) # center = TRUE is a default setting of this function
+pca
+summary(pca)
+```
+
+We observe that most variables have a significant contribution on at least one of the first few PCs. The first 5 principal components capture over 70% of the variance. A scree plot will show more detail on this:
+
+```{r}
+fviz_screeplot(pca, addlabels = TRUE)
+```
+
+There's a sharp drop after PC1, which confirms PC1 captures a substantial, though not too high portion of the total variance alone. After PC2, the decline becomes more gradual.
+
+We can also plot the contribution of the variables to each PC more visually:
+
+### PC1
+
+```{r}
+pca$rotation[, 1]
+barplot(pca$rotation[, 1], las = 2, col = "darkblue")
+fviz_contrib(pca, choice = "var", axes = 1)
+```
+
+PC1 has strong positive loadings for GDP per capita (0.40), credit_finance (0.35), and credit_private (0.37), and strong negative loadings for self_employed (-0.38) and tax_payments (-0.32). As we will confirm later, PC1 shows a relatively even spread of contributions, suggesting a broad, multi-dimensional component rather than one clearly dominated by just one or two variables, which is the case for other components. This implies that PC1 likely represents overall economic development and financial sector sophistication. Higher PC1 values correspond to wealthier economies with stronger financial systems, fewer self-employed individuals (indicating more formal employment), and more business-friendly institutions. Meanwhile, lower PC1 values are associated with higher self-employment rates, weaker financial infrastructure, and heavier administrative burdens on businesses. The opposition between GDP and self-employment aligns with the negative correlation we observed earlier.
+
+We can also show the ten countries with the higher and lower scores of each PC. Since each component represents a different combination of variables and aims at grasping a different dimension of the data, these rankings should not be the same across all PCs.
+```{r}
+id_cols$country_name[order(pca$x[, 1])][1:10]
+id_cols$country_name[order(pca$x[, 1], decreasing = TRUE)][1:10]
+```
+
+```{r}
+hist(pca$x[, 1], main = "Distribution of PC1", xlab = "PC1 Scores")
+```
+
+PC1 scores seem to be centered around 0, with relative symmetry and some outliers on both ends. This supports that PC1 captures a balanced dimension of overall business environment. This component shows one of the highest variabilities.
+
+### PC2
+
+```{r}
+pca$rotation[, 2]
+barplot(pca$rotation[, 2], las = 2, col = "darkblue")
+fviz_contrib(pca, choice = "var", axes = 2)
+```
+
+PC2 is most strongly defined by unemployment (-0.62), followed by a number of business environment variables (time required to start a business, time required to enforce a contract, time required to register a property, public credit registry coverage), with moderate negative loadings. This component appears to capture labor market conditions and business regulatory environment. Countries with lower scores would likely have higher unemployment rates and more bureaucratic business environments, while countries with higher scores would have lower unemployment with simpler or more dynamic business regulations.
+
+```{r}
+id_cols$country_name[order(pca$x[, 2])][1:10]
+id_cols$country_name[order(pca$x[, 2], decreasing = TRUE)][1:10]
+```
+
+```{r}
+hist(pca$x[, 2], main = "Distribution of PC2", xlab = "PC2 Scores")
+```
+
+The distribution of PC2 scores in our dataset shows a slight negative skew. The skew indicates that while most countries perform well on these aspects, a few lag behind, pulling the average downward.
+
+### PC3
+
+```{r}
+pca$rotation[, 3]
+barplot(pca$rotation[, 3], las = 2, col = "darkblue")
+fviz_contrib(pca, choice = "var", axes = 3)
+```
+
+PC3 is heavily loaded on foreign_invest (-0.69) and credit_cover (0.59). These two variables stand out in their contribution, being the only ones that exceed the expected average contribution (the red dashed line). There's a significant drop-off after them, with the next tier of variables contributing much less: exports (about 5%), tax payments (about 4%), and time required to register property (about 3%). This dimension seems to contrast foreign investment with credit coverage systems, with minimal influence from other variables.
+
+```{r}
+id_cols$country_name[order(pca$x[, 3])][1:10]
+id_cols$country_name[order(pca$x[, 3], decreasing = TRUE)][1:10]
+```
+
+```{r}
+hist(pca$x[, 3], main = "Distribution of PC3", xlab = "PC3 Scores")
+```
+
+The third PC's distribution is skewed to the right, this long right tail implies that most countries have low to moderate scores, but a few have exceptionally high values.
+
+### PC4
+
+```{r}
+pca$rotation[, 4]
+barplot(pca$rotation[, 4], las = 2, col = "darkblue")
+fviz_contrib(pca, choice = "var", axes = 4)
+```
+
+The fourth PC shows a strong negative loading for time required to enforce a contract (-0.65), while exports of goods and services has a strong positive loading (0.53). The variables regarding domestic credit provided by the financial sector and domestic credit to the private sector have more moderate negative contributions (0.35 and 0.3 respectively). The mix of trade openness (exports) and financial efficiency suggests that this component might capture differences in economic integration vs. bureaucratic constraints and domestic finance. High values suggest economies that lean more on trade for growth, while low values indicate economies that rely on domestic credit markets.
+
+```{r}
+id_cols$country_name[order(pca$x[, 4])][1:10]
+id_cols$country_name[order(pca$x[, 4], decreasing = TRUE)][1:10]
+```
+
+```{r}
+hist(pca$x[, 4], main = "Distribution of PC4", xlab = "PC4 Scores")
+```
+
+PC4 is moderately skewed towards the negative values, which means that many countries tend to have lower scores on this component. The variability of countries on this component appears to be low.
+
+### PC5
+
+```{r}
+pca$rotation[, 5]
+barplot(pca$rotation[, 5], las = 2, col = "darkblue")
+fviz_contrib(pca, choice = "var", axes = 5)
+```
+
+For PC5, the strong positive loadings of time required for starting a business (0.51) and tax payments (0.31) suggest that this component is tied to administrative processes and regulatory burdens, while domestic credit provided by financial sector (0.35) and domestic credit for private sector (0.34) indicate a connection with the financial sector. On the other hand, the component has negative contributions of foreign direct investment (-0.42), time required to enforce a contract (-0.35) and public credit registry coverage (-0.25).
+
+```{r}
+id_cols$country_name[order(pca$x[, 5])][1:10]
+id_cols$country_name[order(pca$x[, 5], decreasing = TRUE)][1:10]
+```
+
+```{r}
+hist(pca$x[, 5], main = "Distribution of PC5", xlab = "PC5 Scores")
+```
+
+PC5 is slightly skewed to the right, with limited variability. Most countries are centered around zero, while a few observations seem to have unusually high values on this component.
+
+### Visualizations
+
+Next, I will plot and comment the distribution of the countries in our dataset across the first four principal components. Two 2D graphs will be used.
+
+```{r}
+pca_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], Country = id_cols$country_name, Continent = id_cols$continent)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Continent, label = Country)) +
+  geom_point(alpha = 0.6) +
+  geom_text(size = 3, hjust = 0.5, vjust = -0.5, check_overlap = TRUE) +
+  labs(title = "Distribution of countries across Principal Components 1 and 2",
+       x = "PC1",
+       y = "PC2") +
+  theme_minimal()
+```
+
+This plot represents the distribution of the countries in our dataset across the first two principal components, which together explain nearly 47% of the total variance. From it we can draw a pattern of continent grouping:
+
+-   **African countries** predominantly appear in the left half of the plot (negative PC1 values and positive PC2 values)
+
+-   **European countries** generally cluster in the right side (positive PC1 values) and have some spread on the y-axis, although they show more presence in the negative values
+
+-   **Asian countries** show considerable spread on PC1, but concentrate around positive values for PC2
+
+-   **American countries** show some dispersion, but tend to cluster around the middle part of the plot
+
+-   **Oceanic countries** show great variability on the horizontal axis, but cluster mostly on the upper side of the plot, with positive PC2 values
+
+```{r}
+pca_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], Country = id_cols$country_name, Continent = id_cols$continent)
+
+pca_df |> 
+  # filter(!Country %in% "Mongolia") |> 
+ggplot(aes(x = PC3, y = PC4, color = Continent, label = Country)) +
+  geom_point(alpha = 0.6) +
+  geom_text(size = 3, hjust = 0.5, vjust = -0.5, check_overlap = TRUE) +
+  labs(title = "Distribution of countries across Principal Components 3 and 4",
+       x = "PC3",
+       y = "PC4") +
+  theme_minimal()
+```
+
+This scatter plot shows the distribution of countries across Principal Components 3 and 4, which together explain about 16.8% of the total variance in our dataset. The lack of clear continental clustering in this plot suggests that the factors captured by PC3 and PC4 (foreign investment vs. credit coverage, and export orientation vs. contract enforcement) vary within regions rather than between them. We do see that most European and African countries cluster around the upper part of the graph, while the lower part has more presence on Asian and American countries. Overall, higher values of PC4 gather more observations, with less countries scoring below -1 on this component. On the other hand, the interpretation of the horizontal axis is hindered by an extreme outlier: Mongolia.
+
+```{r}
+pca_df |> 
+  filter(!Country %in% "Mongolia") |>
+ggplot(aes(x = PC3, y = PC4, color = Continent, label = Country)) +
+  geom_point(alpha = 0.6) +
+  geom_text(size = 3, hjust = 0.5, vjust = -0.5, check_overlap = TRUE) +
+  labs(title = "Distribution of countries across Principal Components 3 and 4",
+       x = "PC3",
+       y = "PC4") +
+  theme_minimal()
+```
+
+Filtering out Mongolia gives us a clearer view of the distribution of countries across PC3. We can state, however, that the countries are somewhat uniformly distributed, without very clear continent-level patterns emerging.
+
+## Clustering
+
+In the following section we will use clustering techniques to group countries based on their business environment and dynamism, aiming to uncover meaningful patterns and similarities.
+
+### K-means clustering
+
+Here, I will apply K-means clustering to divide countries into distinct groups. The first step will be to visualize the WSS (elbow method) and Silhouette plots to decide on the optimal number of clusters.
+
+```{r}
+fviz_nbclust(scale(X), kmeans, method = 'wss', k.max = 20, nstart = 1000)
+fviz_nbclust(scale(X), kmeans, method = 'silhouette', k.max = 20, nstart = 1000)
+```
+
+According to both graphs, the optimal number of clusters (elbow) seems to be 2.
+
+Then, we can go into running the k-means clustering algorithm:
+
+```{r}
+fit <- kmeans(scale(X), centers = 2, nstart = 1000)
+table(fit$cluster)
+```
+
+The countries are divided into two clusters, with 88 and 104 observations each.
+
+```{r}
+centers <- fit$centers
+
+barplot(centers[1,], las = 2, col = "darkblue")
+barplot(centers[2,], las = 2, col = "darkblue")
+```
+
+Since we only have two clusters, these two plots look opposite to each other. According to them:
+
+-   **Cluster 1** appears to represent countries with more developed financial systems, more efficient regulatory environments, open and richer economies, more dynamic business environments, simpler tax systems and a labor market centered around salaried work.
+
+-   **Cluster 2** seems to represent countries with less developed and less efficient financial systems, with more bureaucratic boundaries, and a higher rate of self-employment.
+
+At this point, we can visualize the two clusters and the countries included in each of them. We can anticipate that the clusters are likely splitting more advanced vs. developed economies.
+
+```{r}
+fviz_cluster(fit, data = X, geom = c("point"), ellipse.type = 'norm', pointsize=1) + 
+  theme_minimal() + 
+  geom_text(aes(label = id_cols$country_name), hjust = 0, vjust = 0, size = 2, check_overlap = TRUE) +
+  scale_fill_brewer(palette = "Paired")
+```
+
+With our previous knowledge on the world's economies, the plot seems to broadly confirm our hypothesis. The clustering shows a distinct separation along Dimension 1, which explains 36.8% of variance. The red cluster predominantly contains developed economies positioned in the positive region of Dimension 1; the blue cluster predominantly contains developing economies in the negative region of Dimension 1.
+
+Countries like Mexico, Peru, Bulgaria, and Albania are positioned near the interface between clusters, probably representing transitional economies that share characteristics with both developed and developing business environments. Lastly, we observe there is notable within-cluster variation along both dimensions.
+
+### Hierarchical clustering
+
+An alternative technique is to use hierarchical clustering to explore country similarities, allowing for a flexible approach to identifying clusters at different levels.
+
+Many different combinations of distances and linkage methods can be tried out:
+
+```{r}
+dist_list <- list(
+  euclidean = dist(scale(X), method = "euclidean"),
+  manhattan = dist(scale(X), method = "manhattan"),
+  canberra = dist(scale(X), method = "canberra"),
+  minkowski = dist(scale(X), method = "minkowski", p = 3)
+)
+
+linkage_methods <- c("ward.D", "average", "complete", "single")
+
+par(mfrow = c(2, 2))
+for (d_name in names(dist_list)) {
+  for (link in linkage_methods) {
+    hc <- hclust(dist_list[[d_name]], method = link)
+    plot(hc, main = paste("Dendrogram -", d_name, link), cex = 0.6)
+  }
+}
+par(mfrow = c(1, 1))
+```
+
+There does not seem to be a single option that stands out or is dramatically more readable than others.
+
+Once we decide on the optimal distance and linkage method, we can carry on with the analysis and different types of visualizations, such as dendograms, cluster plots and phylogenic trees.
+
+Note that we previously decided on an optimal number of groups of 2.
+
+```{r, warning = FALSE}
+d <- dist(scale(X), method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+
+hc$labels <- id_cols$country_name
+
+# DENDOGRAM
+fviz_dend(x = hc,
+          k = 2,
+          palette = "jco",
+          rect = TRUE, rect_fill = TRUE, cex = 0.5,
+          rect_border = "jco"
+)
+
+# PHYLOGENIC TREE
+fviz_dend(x = hc,
+          k = 2,
+          color_labels_by_k = TRUE,
+          cex = 0.8,
+          type = "phylogenic",
+          repel = TRUE)+  labs(title = "Business-environment tree clustering of the world") + theme(axis.text.x=element_blank(),axis.text.y=element_blank())
+
+# CLUSTPLOT
+clusters_hc <- cutree(hc, k = 2)
+
+fviz_cluster(list(data = scale(X), cluster = clusters_hc), geom = "point")
+```
+
+Each of these methods serves for different purposes. For example, the clustering tree allows us to track similarity among observations: countries that branch together have more similar business environments.
+
+The dendogram shows us the several different subclusters that are formed at different heights, indicating the possibility of a multilevel classification.
+
+On another note, the clustplot allows us to check the overlapping, as well as the variability inside each cluster, and the distribution of the observations across dimensions 1 and 2. Cluster 1 (red) countries are positioned primarily in the negative region of Dimension 1, while cluster 2 (blue) countries span from the negative to positive regions of Dimension 1. There's some separation along Dimension 2 as well, but it's less pronounced.
+
+It should be noted that, as was mentioned earlier, the proportion of variability captured by these two dimensions is relatively low.
+
+Lastly, we can plot the clustering in a map:
+
+```{r, warning = FALSE}
+clusters2 <- cutree(hc, k = 2)
+table(Cluster = clusters2, Continent = id_cols$continent)
+
+map_data <- data.frame(country = id_cols$country_name, cluster = clusters2)
+
+map_data$iso3c <- countrycode(map_data$country, 'country.name', 'iso3c')
+
+matched <- joinCountryData2Map(map_data, joinCode = "ISO3", nameJoinColumn = "iso3c")
+
+mapCountryData(matched,
+               nameColumnToPlot = "cluster",
+               missingCountryCol = "white",
+               borderCol = "#C7D9FF",
+               catMethod = "pretty",
+               colourPalette = "rainbow",
+               mapTitle = "Hierarchical Clustering of Business Environment",
+               lwd = 1)
+
+```
+
+This map allows for a clearer interpretation of geographical patterns: we see that most African nations, as well as some countries in Southern Asia, are colored in purple. One of the most interesting insights is that the nations of North and Southern Africa show traits more similar to those of the more advanced economies, while a wide central belt of the continent remains on the side of the developing economies. On the other end, most developed economies (North America, Europe, Australia, parts of East Asia, the Arabian Peninsula, etc.) are colored in red. The map also shows some interesting outliers, that is, countries that do not cluster with their geographic neighbors, suggesting that the characteristics of the business environment may transcend regional patterns. Colombia might be an example of this, although it is true that it could share more characteristics with its Caribbean neighbors rather than other countries in South America.
+
+## Final considerations
+
+Our analysis aimed to determine whether countries can be classified based on their business dynamism using PCA and clustering techniques.
+
+PCA identified key dimensions of business environments: the first few principal components captured major aspects of business dynamism, such as economic development, financial accessibility, and regulatory efficiency. PCA also showed that 5-6 components were needed in order to capture around 75% of the variability in the dataset. This might point to the fact that business dynamism is influenced by a broad set of factors, or even that some important features were missing from our current selection of variables.
+
+The clustering results revealed meaningful groupings of countries with similar business conditions. Countries with high economic development, strong financial sectors, and streamlined administrative processes tended to cluster together, while those with weaker financial infrastructure and higher administrative burdens formed separate groups.
+
+Ultimately, while the clusters largely align with known economic and regional divisions, there are some outliers: countries that do not fit neatly into one category due to unique financial or regulatory conditions. In some cases, we also observed considerable overlapping, indicating that the division is not always that clear. Ultimately, while broad classifications are feasible, a nuanced approach is needed to fully understand business environments.
+
+Unfortunately, the optimal number of clusters was pretty low (2), suggesting that, despite the diversity of economic environments, countries tend to fall into just a few broad categories when it comes to business dynamism. This probably limits the explanatory power of the analysis to some extent. If only two large groups emerge, this suggests that our variables might not incorporate enough granularity to capture more subtle differences across countries.
+
+```{r, include = FALSE}
+
+```
+
